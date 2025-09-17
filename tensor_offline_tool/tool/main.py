@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Sequence, Any
 import numpy as np
 
 from .core.constants import ATOM_B
@@ -13,13 +13,55 @@ from .core.simulator import SimConfig, simulate
 from .vis.visualize import render_visualization
 from tensorviz_dashboard_unified_v21 import evaluate_pipeline
 
+def _ensure_tuple_shape(shape_candidate: Optional[Sequence[int] | np.ndarray]) -> Optional[tuple[int, ...]]:
+    """Validate and normalize a caller-provided tensor shape."""
+    if shape_candidate is None:
+        return None
+    try:
+        shape_iter = list(shape_candidate)
+    except TypeError as exc:  # pragma: no cover - defensive guard
+        raise TypeError("final_shape must be an iterable of integers") from exc
+    normalized = tuple(int(dim) for dim in shape_iter)
+    if any(dim < 0 for dim in normalized):
+        raise ValueError("Tensor shapes must contain non-negative dimensions")
+    return normalized
+
+
+def _normalize_final_mapping(mapping: Optional[Sequence[Any] | np.ndarray],
+                             shape_hint: Optional[tuple[int, ...]]) -> tuple[Optional[np.ndarray], Optional[tuple[int, ...]]]:
+    """Return (mapping_array, inferred_shape) validating consistency."""
+    if mapping is None:
+        return None, shape_hint
+
+    try:
+        mapping_arr = np.asarray(mapping)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise TypeError("final_mapping must be array-like") from exc
+
+    if mapping_arr.ndim == 0:
+        raise ValueError("final_mapping must describe at least one dimension")
+
+    # Ensure integer dtype without copying when unnecessary.
+    if mapping_arr.dtype.kind not in {"i", "u"}:
+        mapping_arr = mapping_arr.astype(np.int64)
+
+    inferred_shape = shape_hint or tuple(int(d) for d in mapping_arr.shape)
+    if mapping_arr.shape != inferred_shape:
+        raise ValueError(
+            "Shape mismatch between final_mapping and final_shape: "
+            f"mapping shape {mapping_arr.shape} vs expected {inferred_shape}"
+        )
+
+    return mapping_arr, inferred_shape
+
+
 def compile_and_run(workbook_path: str,
                     pixel_bits: int,
                     zero_mode: str,
                     viz: str,
                     gap_budget_B: Optional[int],
-                    final_mapping: Optional[np.ndarray] = None,
-                    final_shape: Optional[tuple] = None,
+                    final_mapping: Optional[Sequence[Any] | np.ndarray] = None,
+                    final_shape: Optional[Sequence[int] | np.ndarray] = None,
                     input_axes: Optional[List[str]] = None):
     """
     Executes the full compilation and simulation pipeline.
@@ -33,18 +75,26 @@ def compile_and_run(workbook_path: str,
 
     mapping_spec = read_workbook(workbook_path, pixel_bits=pixel_bits)
 
-    if final_mapping is None or final_shape is None:
+    normalized_shape = _ensure_tuple_shape(final_shape)
+    final_mapping_arr, normalized_shape = _normalize_final_mapping(final_mapping, normalized_shape)
+
+    if final_mapping_arr is None or normalized_shape is None:
         mock_op_config = {
             "tensor": {"shape": mapping_spec.input_shape, "axes": [d[0] for d in mapping_spec.dims]},
             "operations": []
         }
         states = evaluate_pipeline(mock_op_config)
         final_state = states[-1]
-        final_mapping = np.array(final_state['mapping'])
-        final_shape = final_state['shape']
+        final_mapping_arr = np.asarray(final_state['mapping'])
+        if final_mapping_arr.dtype.kind not in {"i", "u"}:
+            final_mapping_arr = final_mapping_arr.astype(np.int64)
+        normalized_shape = tuple(int(dim) for dim in final_state['shape'])
 
     if input_axes is None:
         input_axes = [d[0] for d in mapping_spec.dims]
+
+    final_shape = normalized_shape
+    final_mapping = final_mapping_arr
 
     gap_budget_atoms = None if gap_budget_B is None else gap_budget_B // ATOM_B  # kept for backward compat (unused)
     gap_budget_B_int = None if gap_budget_B is None else int(gap_budget_B)
